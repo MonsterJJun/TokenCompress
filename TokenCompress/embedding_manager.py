@@ -80,6 +80,53 @@ class EmbeddingManager:
             for t, row in saved.items():
                 self.embed.weight[t] = row
 
+    def sync_output_embedding(self):
+        """
+        input embedding의 target 행 값을 output(lm_head)에도 그대로 복사.
+        gradient로 lm_head를 학습시키는 게 아니라, 매 스텝 끝에 값만 덮어씀
+        (lm_head.requires_grad는 계속 False, optimizer도 안 건드림).
+
+        tied 모델이면 input==output이 이미 같은 텐서라 아무 것도 안 함(무해).
+        untied 모델에서만 실질적 효과가 있음.
+        """
+        out_embed = self.model.get_output_embeddings()
+        if out_embed is None:
+            return
+        if out_embed.weight.data_ptr() == self.embed.weight.data_ptr():
+            return   # tied 모델이면 이미 같은 텐서라 동기화할 필요 없음
+        with torch.no_grad():
+            for tid in self.target_token_ids:
+                out_embed.weight[tid] = self.embed.weight[tid].detach().to(
+                    dtype=out_embed.weight.dtype
+                )
+
+    def clamp_target_norm(self, max_norm=None, max_norm_multiplier=3.0):
+        """
+        target 행의 norm이 기준치를 넘으면 강제로 줄임 (max-norm 제약).
+
+        tied 임베딩 모델에서는 target 벡터가 "입력 조건"과 "출력 예측 후보"를
+        동시에 담당하기 때문에, 학습 중 norm이 통제 없이 커지면(vocab 평균의
+        수 배까지) 해당 토큰이 문맥과 무관하게 스스로를 다음 토큰으로 강하게
+        예측해버리는 현상(logit = hidden·embed가 순전히 큰 norm 때문에
+        비정상적으로 커짐)이 생길 수 있음. weight_decay만으로는 이 힘을
+        못 이길 때, 매 스텝 직접 상한을 걸어주는 것.
+
+        max_norm: 직접 지정. None이면 orig_vocab의 평균 norm × max_norm_multiplier로 자동 계산.
+        """
+        with torch.no_grad():
+            if max_norm is None:
+                vocab_avg_norm = self.embed.weight[:self.orig_vocab].float().norm(dim=-1).mean().item()
+                max_norm = vocab_avg_norm * max_norm_multiplier
+
+            clamped = []
+            for tid in self.target_token_ids:
+                v = self.embed.weight[tid]
+                n = v.float().norm().item()
+                if n > max_norm:
+                    self.embed.weight[tid] = v * (max_norm / n)
+                    clamped.append((tid, n, max_norm))
+            return clamped   # 실제로 잘린 (id, 이전norm, 상한) 목록 — 로깅용
+
     def get_vectors(self):
         return {name: self.embed.weight[t].detach().clone()
                 for name, t in zip(self.token_names, self.target_token_ids)}

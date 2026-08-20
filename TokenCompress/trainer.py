@@ -1,10 +1,5 @@
 """
-CustomTokenTrainer — PromptBuilder / EmbeddingManager / CheckpointManager /
-MetricTracker를 조립한 학습기. 기존 단일 파일 버전과 동일하게 동작.
-
-디버그가 필요하면 TrainerDebugger를 attach해서 사용:
-    with TrainerDebugger(trainer, keys={"recon"}):
-        trainer.train_step(query, answer_ids)
+CustomTokenTrainer — PromptBuilder / EmbeddingManager / CheckpointManager / MetricTracker
 """
 import torch
 import torch.nn.functional as F
@@ -33,6 +28,8 @@ class CustomTokenTrainer:
         kd_tau_squared: bool = True,     # True: τ² 곱함(논문 실측값과 일치)
         prompt_mode: str = "chat",       # "chat" | "raw"
         enable_thinking=False,           # True | False | None
+        sync_output_embedding: bool = False,  # True: untied 모델에서 lm_head도 매 스텝 동기화
+        clamp_norm_multiplier=None,           # None이면 clamp 안 함. 숫자면 vocab평균×이값으로 상한
     ):
         self.args = args
         self.model = model
@@ -40,6 +37,8 @@ class CustomTokenTrainer:
         self.device = args.device
         self.recon_reduction = recon_reduction
         self.kd_tau_squared = kd_tau_squared
+        self.sync_output_embedding = sync_output_embedding
+        self.clamp_norm_multiplier = clamp_norm_multiplier
         assert recon_reduction in ("sum", "mean"), \
             f"recon_reduction must be 'sum' or 'mean', got {recon_reduction}"
 
@@ -118,24 +117,30 @@ class CustomTokenTrainer:
         """
         논문 수식(원표기): L_recon = -Σ_j log P(s_j | [target..],[AE],s_<j)  — sum.
         논문 실측 loss 크기와 대조 검증한 결과 mean이 일치해서 기본값을 "mean"으로 둠.
-        HF의 out.loss(labels 넘겼을 때 자동 계산)에 의존하지 않고 직접 계산 —
-        reduction 전환을 명시적으로 제어하기 위함.
+
+        reduction="mean"일 땐 HF의 out.loss(labels 넘겨서 자동 계산)를 그대로 사용 —
+        HF 내부 구현(ForCausalLMLoss)과 우리 수동 재구현이 수치적으로 동일함을
+        이미 검증했으므로, 굳이 다시 계산할 필요 없이 HF의 검증된 경로를 신뢰함.
+        reduction="sum"일 때만 HF가 그 옵션을 안 주므로 직접 계산.
+        두 경로 모두 out.logits는 항상 반환되므로 디버거 기능은 동일하게 작동.
         """
         r = self.builder.build_recon()
         input_ids, labels = r["input_ids"], r["labels"]
 
-        out = self.model(input_ids=input_ids)   # labels 안 넘김 — reduction 직접 제어
-        logits = out.logits.float()
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-            reduction=self.recon_reduction,
-        )
+        if self.recon_reduction == "mean":
+            out = self.model(input_ids=input_ids, labels=labels)   # HF 자동 계산(mean) 신뢰
+            loss = out.loss
+        else:  # "sum" — HF가 제공 안 하므로 직접 계산
+            out = self.model(input_ids=input_ids)
+            logits = out.logits.float()
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
 
         if self.debugger:
             self.debugger.on_recon(input_ids, labels, out, r["prefix_len"], loss)
@@ -190,6 +195,13 @@ class CustomTokenTrainer:
 
     def _restore_frozen_rows(self):
         self.emb.restore_frozen_rows()
+        if self.sync_output_embedding:
+            self.emb.sync_output_embedding()
+        if self.clamp_norm_multiplier is not None:
+            clamped = self.emb.clamp_target_norm(max_norm_multiplier=self.clamp_norm_multiplier)
+            if clamped and self.debugger:
+                for tid, old_norm, cap in clamped:
+                    print(f"  [clamp] id={tid} norm {old_norm:.4f} -> {cap:.4f}")
 
     # -----------------------------------------------------------------
     # 한 step
@@ -230,7 +242,7 @@ class CustomTokenTrainer:
         if self.debugger:
             self.debugger.after_optimizer_step()
 
-        self.emb.restore_frozen_rows()
+        self._restore_frozen_rows()
 
         if self.debugger:
             self.debugger.after_restore()
@@ -264,7 +276,24 @@ class CustomTokenTrainer:
     # -----------------------------------------------------------------
     # 학습 루프
     # -----------------------------------------------------------------
-    def train(self, teacher_dataset, eval_dataset=None):
+    def train(self, teacher_dataset, eval_dataset=None,
+              live_plot_every=0, live_plot_unit="step",
+              live_plot_smooth=1, live_plot_log=False, live_plot_both_scales=False,
+              early_stopping_patience=None):
+        """
+        live_plot_every: 0이면 비활성(기본, 기존 동작과 완전히 동일).
+        live_plot_unit: "step" 또는 "epoch" — live_plot_every를 스텝 단위로 셀지,
+                        에폭 단위로 셀지 결정.
+        live_plot_both_scales: True면 log_scale과 무관하게 선형/로그 그래프를 매번 둘 다 그리고 저장.
+        early_stopping_patience: None이면 비활성(기본, 기존 동작과 완전히 동일).
+                                  N(>0)이면 eval_total 기준으로 N번 연속 개선이 없으면
+                                  남은 epoch을 기다리지 않고 학습을 조기 종료.
+                                  (eval_dataset이 None이면 애초에 eval 자체가 안 돌아
+                                   아무 효과 없음 — eval_dataset과 함께 사용해야 함)
+        """
+        assert live_plot_unit in ("step", "epoch"), \
+            f"live_plot_unit must be 'step' or 'epoch', got {live_plot_unit}"
+
         loader = DataLoader(teacher_dataset, batch_size=1, shuffle=True,
                             collate_fn=lambda x: x[0])
 
@@ -305,6 +334,11 @@ class CustomTokenTrainer:
                     print(f"[epoch {epoch+1} step {step}] total={logs['total']:.4f} "
                           f"recon={logs['recon']:.4f} kd={logs['kd']:.4f} lr={lr_now:.3e}")
 
+                if live_plot_unit == "step" and live_plot_every > 0 and step % live_plot_every == 0:
+                    self.metrics.live_update(self.args.output_dir, tag=f"step{step}",
+                                             smooth=live_plot_smooth, log_scale=live_plot_log,
+                                             both_scales=live_plot_both_scales)
+
                 if save_steps > 0 and step % save_steps == 0:
                     self.save(step)
                 if 0 < self.args.max_steps <= step:
@@ -313,8 +347,20 @@ class CustomTokenTrainer:
             if eval_dataset is not None:
                 self._run_eval_and_save(eval_dataset, epoch)
 
+            if live_plot_unit == "epoch" and live_plot_every > 0 and (epoch + 1) % live_plot_every == 0:
+                self.metrics.live_update(self.args.output_dir, tag=f"epoch{epoch+1}",
+                                         smooth=live_plot_smooth, log_scale=live_plot_log,
+                                         both_scales=live_plot_both_scales)
+
             if save_epochs > 0 and (epoch + 1) % save_epochs == 0:
                 self.save(f"epoch{epoch+1}")
+
+            if (early_stopping_patience is not None and eval_dataset is not None
+                    and self.metrics.should_stop(early_stopping_patience)):
+                print(f"[Early Stopping] eval_total이 {early_stopping_patience}번 연속 "
+                      f"개선 안 됨 (best={self.metrics.best_eval_loss:.6f} @ epoch "
+                      f"{self.metrics.best_epoch}) — epoch {epoch+1}에서 학습 조기 종료")
+                break
 
             if 0 < self.args.max_steps <= step:
                 break
@@ -372,6 +418,8 @@ class CustomTokenTrainer:
               f"recon_reduction={self.recon_reduction}, kd_tau_squared={self.kd_tau_squared}")
         print(f"       prompt_mode={b.prompt_mode}, enable_thinking={b.enable_thinking}, "
               f"init={self.init_mode}")
+        print(f"       sync_output_embedding={self.sync_output_embedding}, "
+              f"clamp_norm_multiplier={self.clamp_norm_multiplier}")
 
     def _run_eval_and_save(self, eval_dataset, epoch):
         ev = self.evaluate(eval_dataset)

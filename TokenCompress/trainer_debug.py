@@ -1,5 +1,5 @@
 """
-TrainerDebugger — CustomTokenTrainer에 붙여서 내부 동작을 관찰하는 debugger
+TrainerDebugger — CustomTokenTrainer에 붙여서 내부 동작을 관찰하는 도구.
 """
 import torch
 import torch.nn.functional as F
@@ -89,6 +89,24 @@ class TrainerDebugger:
         kd_tau_squared = getattr(t, "kd_tau_squared", "(속성 없음 — 구버전)")
         print(f"  recon_reduction={recon_reduction}, kd_tau_squared={kd_tau_squared}")
 
+        sync_output = getattr(t, "sync_output_embedding", "(속성 없음)")
+        clamp_mult = getattr(t, "clamp_norm_multiplier", "(속성 없음)")
+        print(f"  sync_output_embedding={sync_output}, clamp_norm_multiplier={clamp_mult}")
+
+        # tied 여부 + 현재 norm 상태를 clamp 설정과 함께 보여줌 (norm 폭주 조기 발견용)
+        out_embed = t.model.get_output_embeddings()
+        if out_embed is not None:
+            is_tied = out_embed.weight.data_ptr() == t.embed.weight.data_ptr()
+            vocab_avg_norm = t.embed.weight[:orig_vocab].float().norm(dim=-1).mean().item()
+            print(f"  input/output tied 여부: {is_tied}  (vocab 평균 norm={vocab_avg_norm:.4f})")
+            if isinstance(clamp_mult, (int, float)):
+                cap = vocab_avg_norm * clamp_mult
+                print(f"  clamp 상한선: {cap:.4f} (평균×{clamp_mult})")
+                for i, tid in enumerate(t.target_token_ids):
+                    n = t.embed.weight[tid].float().norm().item()
+                    flag = " ⚠️ 상한 초과!" if n > cap else ""
+                    print(f"    {names[i]} 현재 norm={n:.4f}{flag}")
+
         if hasattr(t, "builder"):
             print()
             print(f"  [PromptBuilder 설정]")
@@ -126,8 +144,8 @@ class TrainerDebugger:
         # 1) 템플릿 치환
         filled = b.fill_template(query)
         print("[1] fill_template()")
-        print(f"  입력 query : {query[:]!r}")
-        print(f"  치환 결과  : {filled[:]!r}")
+        print(f"  입력 query : {query[:100]!r}")
+        print(f"  치환 결과  : {filled[:300]!r}")
         if b.user_template is not None:
             assert query in filled, "⚠️ query가 템플릿에 안 들어감!"
             assert "{user_text}" not in filled, "⚠️ 치환 안 된 자리표시자 남음!"
@@ -354,11 +372,11 @@ class TrainerDebugger:
         print(f"  T_prime    : {T_prime}")
         print()
         print(f"  [Teacher] prefix 길이={len(tp_ids)}, slice 시작={start_t}")
-        print(f"    prefix: {built['teacher_prefix'][:]!r}")
+        print(f"    prefix 끝: {built['teacher_prefix'][:]!r}")
         print()
         print(f"  [Student] prefix 길이={len(sp_ids)}, slice 시작={start_s}  "
               f"(system=[{token_desc}])")
-        print(f"    prefix: {built['student_prefix'][:]!r}")
+        print(f"    prefix 끝: {built['student_prefix'][:]!r}")
         print()
         print(f"  ※ 압축 비율: {len(tp_ids)}/{len(sp_ids)} = "
               f"{len(tp_ids)/max(len(sp_ids),1):.1f}x")
@@ -431,3 +449,15 @@ class TrainerDebugger:
         diff = (t.embed.weight - t._frozen_embed).abs().sum(dim=1)
         changed = (diff > 0).nonzero(as_tuple=True)[0].tolist()
         print(f"  복원 후 원본과 다른 행 : {changed}  (target만 남아야 정상)")
+
+        clamp_mult = getattr(t, "clamp_norm_multiplier", None)
+        if clamp_mult is not None:
+            names = self._token_names(t)
+            n_special = 1 + t.n_target
+            orig_vocab = t.embed.weight.shape[0] - n_special
+            vocab_avg = t.embed.weight[:orig_vocab].float().norm(dim=-1).mean().item()
+            cap = vocab_avg * clamp_mult
+            for i, tid in enumerate(t.target_token_ids):
+                n = t.embed.weight[tid].float().norm().item()
+                flag = " (상한 근접/도달)" if n >= cap * 0.99 else ""
+                print(f"    [clamp 체크] {names[i]} norm={n:.4f} / 상한={cap:.4f}{flag}")

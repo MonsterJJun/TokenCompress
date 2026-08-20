@@ -6,10 +6,10 @@ save_experiment_report — 학습 하나가 끝날 때마다 설정/loss/평가 
 저장물:
   {output_dir}/{name}/config.json          — 초기화/하이퍼파라미터 설정
   {output_dir}/{name}/recon_eval.json      — 재구성 평가 (Evaluator.reconstruct 결과)
-  {output_dir}/{name}/task_eval.json       — 태스크/gold 비교 등 커스텀 평가 결과
-  {output_dir}/{name}/summary.txt          — 종합 리포트
+  {output_dir}/{name}/task_eval.json       — 거절태스크/gold 비교 등 커스텀 평가 결과
+  {output_dir}/{name}/summary.txt          — 사람이 읽기 좋은 종합 리포트 (콘솔과 동일 형식)
   {output_dir}/{name}/loss.png, loss_log.png, loss_eval.png, loss_eval_log.png
-                                             — metrics.plot()이 저장한 그래프
+                                             — metrics.plot()이 저장한 그래프 (자동 이동)
 """
 import os
 import json
@@ -76,6 +76,8 @@ def build_config_dict(trainer):
         },
         "recon_reduction": getattr(t, "recon_reduction", None),
         "kd_tau_squared": getattr(t, "kd_tau_squared", None),
+        "sync_output_embedding": getattr(t, "sync_output_embedding", None),
+        "clamp_norm_multiplier": getattr(t, "clamp_norm_multiplier", None),
         "prompt_builder": b.summary(),
         "args_전체(기본값포함)": all_args,
     }
@@ -102,6 +104,8 @@ def _format_summary_text(name, config, recon_result, task_eval_result, metrics_s
     lines.append(f"  betas={opt['betas']}  eps={opt['eps']}  weight_decay={opt['weight_decay']}")
     lines.append(f"  recon_reduction  : {config['recon_reduction']}, "
                   f"kd_tau_squared={config['kd_tau_squared']}")
+    lines.append(f"  sync_output_embedding : {config['sync_output_embedding']}")
+    lines.append(f"  clamp_norm_multiplier : {config['clamp_norm_multiplier']}")
 
     # ── PromptBuilder 설정 ──
     lines.append(f"\n{SEP}")
