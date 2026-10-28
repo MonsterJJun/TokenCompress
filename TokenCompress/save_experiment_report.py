@@ -10,10 +10,15 @@ save_experiment_report — 학습 하나가 끝날 때마다 설정/loss/평가 
   {output_dir}/{name}/summary.txt          — 사람이 읽기 좋은 종합 리포트 (콘솔과 동일 형식)
   {output_dir}/{name}/loss.png, loss_log.png, loss_eval.png, loss_eval_log.png
                                              — metrics.plot()이 저장한 그래프 (자동 이동)
+  {output_dir}/{name}/live_log/            — 학습 중 live_update()가 만든 그래프 폴더 (자동 이동)
+  {output_dir}/{name}/compressed_vectors_final.pt — 학습 종료 시점(final) target 벡터
+  {output_dir}/{name}/compressed_vectors_best.pt  — eval 기준 best 시점 target 벡터
+                                             (best 스냅샷이 없으면 final과 동일한 값으로 대체 저장)
 """
 import os
 import json
 import shutil
+import torch
 
 
 def _to_jsonable(obj):
@@ -169,7 +174,7 @@ def _format_summary_text(name, config, recon_result, task_eval_result, metrics_s
         if wrong:
             lines.append(f"\n  [불일치 케이스 (총 {len(wrong)}개 중 최대 10개)]")
             for item in wrong[:10]:
-                q = item.get("query", "")[:60]
+                q = item.get("query", "")[:]
                 pred = item.get("student") or item.get("pred") or ""
                 lines.append(f"    query: {q}...")
                 lines.append(f"    pred : {pred!r}")
@@ -180,11 +185,19 @@ def _format_summary_text(name, config, recon_result, task_eval_result, metrics_s
 
 def save_experiment_report(output_dir, name, trainer, recon_result=None,
                             task_eval_result=None, move_loss_plots=True,
-                            loss_plot_prefix=None):
+                            loss_plot_prefix=None, live_log_source_dir=None):
     """
     output_dir/name/ 폴더에 config.json, recon_eval.json, task_eval.json,
     summary.txt를 저장. loss_plot_prefix로 지정한 경로에 이미 저장된
     {prefix}.png/_log.png/_eval.png/_eval_log.png가 있으면 같은 폴더로 옮겨줌.
+
+    live_log_source_dir: 학습 중 live_update()가 만든 live_log 폴더의 원본 경로.
+                          None이면 output_dir/live_log를 자동으로 찾아서 이동 시도
+                          (기존 호출부를 바꾸지 않아도 자동으로 동작하게 하기 위함).
+    trainer로부터 target 벡터(final/best)를 직접 뽑아 exp_dir 안에 .pt로 저장:
+      - compressed_vectors_final.pt : 현재 라이브 모델의 target 벡터 (학습 종료 시점)
+      - compressed_vectors_best.pt  : eval_total 기준 best 스냅샷
+                                       (trainer.best_vectors가 없으면 final과 동일값으로 대체)
     """
     exp_dir = os.path.join(output_dir, name)
     os.makedirs(exp_dir, exist_ok=True)
@@ -208,6 +221,14 @@ def save_experiment_report(output_dir, name, trainer, recon_result=None,
         with open(os.path.join(exp_dir, "metrics_summary.json"), "w", encoding="utf-8") as f:
             json.dump(_to_jsonable(metrics_summary), f, ensure_ascii=False, indent=2)
 
+    # ── history.json — step별/eval별 loss 원본 기록 (plotting 등에 재사용하기 위해 항상 저장) ──
+    history_data = {
+        "history": dict(trainer.metrics.history),
+        "eval_history": dict(trainer.metrics.eval_history),
+    }
+    with open(os.path.join(exp_dir, "history.json"), "w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(history_data), f, ensure_ascii=False, indent=2)
+
     # ── 사람이 읽기 좋은 텍스트 리포트 ──
     summary_text = _format_summary_text(name, config, recon_result, task_eval_result, metrics_summary)
     with open(os.path.join(exp_dir, "summary.txt"), "w", encoding="utf-8") as f:
@@ -221,6 +242,23 @@ def save_experiment_report(output_dir, name, trainer, recon_result=None,
             if os.path.exists(src):
                 dst = os.path.join(exp_dir, f"loss{suffix}.png")
                 shutil.move(src, dst)
+
+    # ── live_log 폴더를 같은 폴더 안으로 이동 ──
+    src_live_log = live_log_source_dir or os.path.join(output_dir, "live_log")
+    if os.path.isdir(src_live_log):
+        dst_live_log = os.path.join(exp_dir, "live_log")
+        if os.path.exists(dst_live_log):
+            shutil.rmtree(dst_live_log)
+        shutil.move(src_live_log, dst_live_log)
+
+    # ── target 벡터(final/best) 저장 — 전체 모델 대신 벡터(몇 KB)만으로 완전히 재현 가능 ──
+    final_vectors = trainer.emb.get_vectors()
+    torch.save({k: v.cpu() for k, v in final_vectors.items()},
+               os.path.join(exp_dir, "compressed_vectors_final.pt"))
+
+    best_vectors = getattr(trainer, "best_vectors", None) or final_vectors
+    torch.save({k: v.cpu() for k, v in best_vectors.items()},
+               os.path.join(exp_dir, "compressed_vectors_best.pt"))
 
     print(f"\n리포트 저장 완료: {exp_dir}/")
     return exp_dir

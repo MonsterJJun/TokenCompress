@@ -1,5 +1,6 @@
 """
-CustomTokenTrainer — PromptBuilder / EmbeddingManager / CheckpointManager / MetricTracker
+CustomTokenTrainer — PromptBuilder / EmbeddingManager / CheckpointManager /
+MetricTracker를 조립한 학습기.
 """
 import torch
 import torch.nn.functional as F
@@ -101,6 +102,10 @@ class CustomTokenTrainer:
         )
         self.scheduler = None
         self.debugger = None
+        # eval 기준 best 시점의 target 벡터 스냅샷 (전체 모델 대신 이것만 메모리에 보관)
+        self.best_vectors = None
+        self.best_kd_vectors = None
+        self.best_recon_vectors = None
 
     # 기존 인터페이스 호환용 (디버거가 호출)
     def build_recon_inputs(self):
@@ -184,7 +189,10 @@ class CustomTokenTrainer:
         teacher_prob = F.softmax(teacher_logits / tau, dim=-1)
         student_logprob = F.log_softmax(student_logits / tau, dim=-1)
 
-        kd = F.kl_div(student_logprob, teacher_prob, reduction="batchmean")
+        if getattr(self, "kd_loss_type", "kl") == "ce":
+            kd = -(teacher_prob * student_logprob).sum(dim=-1).mean()
+        else:
+            kd = F.kl_div(student_logprob, teacher_prob, reduction="batchmean")
         if self.kd_tau_squared:
             kd = kd * (tau ** 2)
 
@@ -366,9 +374,150 @@ class CustomTokenTrainer:
                 break
 
         pbar.close()
-        self.save("final")
+        # final 시점 벡터는 항상 확보 (final.pt로 저장할 값)
+        final_vectors = self.emb.get_vectors()
+
+        # select_best_model 설정에 따라 "이 학습의 대표 결과"로 어떤 시점을 쓸지 결정.
+        # best/best_kd/best_recon을 요청했는데 해당 스냅샷이 없으면(eval_dataset 안 줬거나
+        # 한 번도 개선이 없었던 경우) final로 자동 대체.
+        select = getattr(self.args, "select_best_model", "final")
+        snapshot_map = {
+            "best": self.best_vectors,
+            "best_kd": self.best_kd_vectors,
+            "best_recon": self.best_recon_vectors,
+        }
+        selected_vectors = snapshot_map.get(select) if select != "final" else final_vectors
+        if selected_vectors is None:
+            print(f"[select_best_model={select!r}] 해당 스냅샷이 없어 final로 대체함")
+            selected_vectors = final_vectors
+            select = "final"
+
+        # 라이브 모델의 target 행을 선택된 시점 값으로 되돌림
+        # (이후 evaluator가 이 상태를 그대로 평가하게 됨)
+        with torch.no_grad():
+            for token_name, tid in zip(self.target_token_strs, self.target_token_ids):
+                self.embed.weight[tid] = selected_vectors[token_name].to(
+                    device=self.embed.weight.device, dtype=self.embed.weight.dtype
+                )
+
+        print(f"[select_best_model={select!r}] 라이브 모델을 이 시점 벡터로 되돌림")
         print("학습 완료")
-        return self.emb.get_vectors()
+        return {"final": final_vectors, "selected": selected_vectors, "selected_tag": select}
+
+    # -----------------------------------------------------------------
+    # train()과 동일한 기능(eval, best 추적/저장, live_plot, early stopping)을
+    # 그대로 유지하면서, epoch이 아니라 "총 스텝 수" 기준으로 도는 버전.
+    # eval_every_steps마다 평가하고, early stopping도 이 주기로 판단함.
+    # -----------------------------------------------------------------
+    def train_by_steps(self, teacher_dataset, total_steps, eval_dataset=None,
+                        eval_every_steps=500, shuffle=True,
+                        live_plot_every=0, live_plot_unit="step",
+                        live_plot_smooth=1, live_plot_log=False, live_plot_both_scales=False,
+                        early_stopping_patience=None):
+        """
+        total_steps: 총 몇 스텝을 돌릴지 (epoch 대신 이걸로 종료 시점 결정).
+        eval_every_steps: 이 스텝마다 eval_dataset으로 평가 + best 갱신 체크
+                          (train()의 "매 epoch마다"에 대응하는 부분).
+        live_plot_unit: "step"만 의미 있음("epoch" 넘기면 "step"과 동일하게 취급됨 —
+                        애초에 epoch 개념이 없으므로).
+        early_stopping_patience: eval_every_steps 주기로 개선 여부를 판단해서,
+                                  N번 연속 미개선이면 조기 종료. train()과 동일한
+                                  MetricTracker.should_stop() 사용.
+        나머지 동작(train_step 호출, best/best_kd/best_recon 스냅샷, final/selected
+        벡터 반환)은 train()과 완전히 동일.
+        """
+        loader = DataLoader(teacher_dataset, batch_size=1, shuffle=shuffle,
+                            collate_fn=lambda x: x[0])
+
+        def _cycle(dl):
+            while True:
+                for b in dl:
+                    yield b
+        it = _cycle(loader)
+
+        from transformers import get_scheduler
+        self.scheduler = get_scheduler(
+            name=self.args.lr_scheduler_type, optimizer=self.optimizer,
+            num_warmup_steps=self.args.warmup_steps, num_training_steps=total_steps,
+        )
+
+        if self.debugger:
+            self.debugger.on_train_start(len(loader), total_steps)
+
+        self._print_config(len(loader), total_steps, accum_steps=1, batch_size=1)
+
+        save_steps = getattr(self.args, "save_steps", 0)
+        eval_round = 0   # eval이 몇 번째 회차인지 (early stopping의 "epoch" 자리를 대신함)
+
+        pbar = tqdm(total=total_steps, desc="Token Training (step 단위)")
+        stop_early = False
+
+        for step in range(1, total_steps + 1):
+            batch = next(it)
+            logs = self.train_step(batch["query"], batch["answer_ids"])
+
+            lr_now = self.scheduler.get_last_lr()[0] if self.scheduler else 0.0
+            self.metrics.log_step(step, logs["total"], logs["recon"], logs["kd"], lr_now)
+
+            pbar.set_postfix(
+                            step=step,
+                            total=f"{logs['total']:.4f}",
+                            recon=f"{logs['recon']:.4f}",
+                            kd=f"{logs['kd']:.4f}",
+                            lr=f"{lr_now:.2e}")
+            pbar.update(1)
+
+            if step % self.args.logging_steps == 0:
+                print(f"[step {step}/{total_steps}] total={logs['total']:.4f} "
+                      f"recon={logs['recon']:.4f} kd={logs['kd']:.4f} lr={lr_now:.3e}")
+
+            if live_plot_every > 0 and step % live_plot_every == 0:
+                self.metrics.live_update(self.args.output_dir, tag=f"step{step}",
+                                         smooth=live_plot_smooth, log_scale=live_plot_log,
+                                         both_scales=live_plot_both_scales)
+
+            if save_steps > 0 and step % save_steps == 0:
+                self.save(step)
+
+            # ── eval_every_steps 주기 — train()의 "매 epoch마다"에 대응 ──
+            if eval_dataset is not None and step % eval_every_steps == 0:
+                eval_round += 1
+                self._run_eval_and_save(eval_dataset, epoch=eval_round - 1)  # epoch 인자는 그대로 재사용(내부에서 +1 해서 라벨링)
+
+                if (early_stopping_patience is not None
+                        and self.metrics.should_stop(early_stopping_patience)):
+                    print(f"[Early Stopping] eval_total이 {early_stopping_patience}번 연속 "
+                          f"개선 안 됨 (best={self.metrics.best_eval_loss:.6f} @ eval_round "
+                          f"{self.metrics.best_epoch}) — step {step}에서 학습 조기 종료")
+                    stop_early = True
+                    break
+
+        pbar.close()
+
+        # ── final/best 벡터 확보 및 select_best_model 반영 (train()과 동일 로직) ──
+        final_vectors = self.emb.get_vectors()
+
+        select = getattr(self.args, "select_best_model", "final")
+        snapshot_map = {
+            "best": self.best_vectors,
+            "best_kd": self.best_kd_vectors,
+            "best_recon": self.best_recon_vectors,
+        }
+        selected_vectors = snapshot_map.get(select) if select != "final" else final_vectors
+        if selected_vectors is None:
+            print(f"[select_best_model={select!r}] 해당 스냅샷이 없어 final로 대체함")
+            selected_vectors = final_vectors
+            select = "final"
+
+        with torch.no_grad():
+            for token_name, tid in zip(self.target_token_strs, self.target_token_ids):
+                self.embed.weight[tid] = selected_vectors[token_name].to(
+                    device=self.embed.weight.device, dtype=self.embed.weight.dtype
+                )
+
+        print(f"[select_best_model={select!r}] 라이브 모델을 이 시점 벡터로 되돌림")
+        print(f"학습 완료 ({'조기 종료' if stop_early else '전체 스텝 완료'})")
+        return {"final": final_vectors, "selected": selected_vectors, "selected_tag": select}
 
     # -----------------------------------------------------------------
     # 가벼운 스텝 단위 학습 (디버깅/실험용)
@@ -422,17 +571,29 @@ class CustomTokenTrainer:
               f"clamp_norm_multiplier={self.clamp_norm_multiplier}")
 
     def _run_eval_and_save(self, eval_dataset, epoch):
+        """
+        epoch: train()에서는 실제 epoch 번호(0-index), train_by_steps()에서는
+               eval 라운드 번호(0-index)로 재사용됨. MetricTracker 내부 기록의
+               '몇 번째 평가였는지' 값으로 쓰이므로 두 경우 모두 일관되게 동작.
+        """
         ev = self.evaluate(eval_dataset)
         improved = self.metrics.log_eval(epoch + 1, ev["eval_total"],
                                          ev["eval_recon"], ev["eval_kd"])
-        print(f"[epoch {epoch+1} EVAL] eval_total={ev['eval_total']:.4f} "
+        print(f"[eval #{epoch+1}] eval_total={ev['eval_total']:.4f} "
               f"eval_recon={ev['eval_recon']:.4f} eval_kd={ev['eval_kd']:.4f}")
+
+        # 전체 모델(수 GB)을 매번 저장하는 대신, target 벡터(몇 KB)만 스냅샷으로 보관.
+        # backbone은 항상 원본과 동일(freeze+restore_frozen_rows)하므로, 벡터만 있으면
+        # 나중에 base 모델 + TokenSetup + 벡터 주입으로 100% 동일하게 재현 가능.
         if improved:
             print(f"[Best 갱신 - total] {self.metrics.best_eval_loss:.6f}")
-            self.save("best")
+            self.best_vectors = self.emb.get_vectors()
         if self.metrics.kd_improved(epoch + 1):
             print(f"[Best 갱신 - KD] {self.metrics.best_eval_kd:.6f}")
-            self.save("best_kd")
+            self.best_kd_vectors = self.emb.get_vectors()
+        if self.metrics.recon_improved(epoch + 1):
+            print(f"[Best 갱신 - Recon] {self.metrics.best_eval_recon:.6f}")
+            self.best_recon_vectors = self.emb.get_vectors()
         return ev
 
     # -----------------------------------------------------------------

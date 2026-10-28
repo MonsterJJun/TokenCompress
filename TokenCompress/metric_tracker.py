@@ -17,6 +17,10 @@ class MetricTracker:
         # KD 기준 best도 별도 추적 (recon 개선에 가려 KD 악화를 놓치지 않도록)
         self.best_eval_kd = float("inf")
         self.best_kd_epoch = None
+        # recon 기준 best도 별도 추적 (lambda가 크면 eval_total이 KD에 지배돼
+        # eval_total 기준 best가 recon 관점에선 최선이 아닐 수 있음)
+        self.best_eval_recon = float("inf")
+        self.best_recon_epoch = None
         # early stopping용 — best_eval_loss 기준 연속 미개선 횟수
         self.epochs_without_improvement = 0
 
@@ -45,11 +49,19 @@ class MetricTracker:
             self.best_eval_kd = eval_kd
             self.best_kd_epoch = epoch
 
+        if eval_recon < self.best_eval_recon:
+            self.best_eval_recon = eval_recon
+            self.best_recon_epoch = epoch
+
         return improved
 
     def kd_improved(self, epoch):
         """직전 log_eval에서 KD 기준 best가 갱신됐는지."""
         return self.best_kd_epoch == epoch
+
+    def recon_improved(self, epoch):
+        """직전 log_eval에서 recon 기준 best가 갱신됐는지."""
+        return self.best_recon_epoch == epoch
 
     def should_stop(self, patience):
         """연속 미개선 횟수가 patience 이상이면 True (early stopping 조건 충족)."""
@@ -69,6 +81,8 @@ class MetricTracker:
             "best_epoch": self.best_epoch,
             "best_eval_kd": self.best_eval_kd,
             "best_kd_epoch": self.best_kd_epoch,
+            "best_eval_recon": self.best_eval_recon,
+            "best_recon_epoch": self.best_recon_epoch,
         }
 
     @staticmethod
@@ -87,7 +101,7 @@ class MetricTracker:
             base, ext = save_path, ".png"
         return f"{base}{suffix}{ext}"
 
-    def plot(self, save_path=None, smooth=1, log_scale=False):
+    def plot(self, save_path=None, smooth=1, log_scale=False, show=True, verbose=True):
         def ma(x, w):
             return list(x) if w <= 1 else list(np.convolve(x, np.ones(w)/w, mode="valid"))
 
@@ -113,8 +127,13 @@ class MetricTracker:
         plt.tight_layout()
         if save_path:
             p = self._save_path(save_path, "_log" if log_scale else "")
-            plt.savefig(p, dpi=150); print(f"저장됨: {p}")
-        plt.show()
+            fig.savefig(p, dpi=150)
+            if verbose:
+                print(f"저장됨: {p}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
         if self.eval_history["epoch"]:
             fig2, ax2 = plt.subplots(figsize=(8, 5))
@@ -130,14 +149,20 @@ class MetricTracker:
             if save_path:
                 # 첫 그래프와 파일명이 겹치지 않도록 "_eval" 접미사 추가
                 p2 = self._save_path(save_path, ("_eval_log" if log_scale else "_eval"))
-                plt.savefig(p2, dpi=150); print(f"저장됨: {p2}")
-            plt.show()
+                fig2.savefig(p2, dpi=150)
+                if verbose:
+                    print(f"저장됨: {p2}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig2)
 
-    def live_update(self, output_dir, tag=None, smooth=20, log_scale=False, both_scales=False):
+    def live_update(self, output_dir, tag=None, smooth=1, log_scale=False, both_scales=False):
         """
         학습 도중 N스텝/N에폭마다 호출해서 지금까지의 loss 그래프를 그림.
         기존 셀 출력은 지우지 않고(clear_output 없음) 그 자리에 새 그래프를 계속 이어서 출력.
-        args.output_dir 아래에 파일로도 저장해서, 학습 도중 언제든 디스크에서 진행상황을 확인 가능.
+        args.output_dir/live_log/ 폴더 아래에 파일로도 저장해서, 학습 도중 언제든
+        디스크에서 진행상황을 확인 가능 (다른 결과 파일들과 안 섞이게 별도 폴더로 분리).
 
         tag: 파일명에 붙일 구분자(보통 step 번호나 "epoch3" 같은 값). None이면 저장 안 하고 화면 출력만.
         both_scales: True면 log_scale 인자와 무관하게 선형/로그 그래프를 둘 다 그림
@@ -147,8 +172,9 @@ class MetricTracker:
             return
         save_path = None
         if tag is not None:
-            os.makedirs(output_dir, exist_ok=True)
-            save_path = os.path.join(output_dir, f"live_loss_{tag}.png")
+            live_log_dir = os.path.join(output_dir, "live_log")
+            os.makedirs(live_log_dir, exist_ok=True)
+            save_path = os.path.join(live_log_dir, f"live_loss_{tag}.png")
 
         if both_scales:
             self.plot(save_path=save_path, smooth=smooth, log_scale=False)

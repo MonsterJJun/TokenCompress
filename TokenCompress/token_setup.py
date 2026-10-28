@@ -10,7 +10,7 @@ import torch
 
 
 class TokenSetup:
-    def __init__(self, model, tokenizer, new_tokens: list, mean_resizing: bool = False,
+    def __init__(self, model, tokenizer, new_tokens: list, mean_resizing: bool = True,
                  freeze_backbone: bool = True, verbose: bool = True):
         """
         new_tokens: 추가할 special token 문자열 리스트. 이미 등록된 토큰이 섞여 있어도

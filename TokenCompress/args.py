@@ -49,3 +49,10 @@ class CustomTrainingArgs:
     lambda_weight: float = 0.9             # KD 비중
     temperature: float = 2.0               # KD temperature
     max_teacher_new_tokens: int = 1024     # teacher 응답 생성 시 최대 길이
+
+    # --- 평가/저장 시 어느 시점 벡터를 기준으로 삼을지 ---
+    select_best_model: str = "final"       # "final" | "best" | "best_kd" | "best_recon"
+                                            # train() 종료 후 평가/최종 벡터 저장에 쓸 기준.
+                                            # "final"이면 지금까지처럼 마지막 epoch 상태 그대로 사용.
+                                            # "best"/"best_kd"/"best_recon"이면 해당 기준으로
+                                            # eval에서 가장 좋았던 시점의 target 벡터로 되돌린 뒤 사용.

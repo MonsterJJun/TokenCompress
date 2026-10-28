@@ -144,8 +144,8 @@ class TrainerDebugger:
         # 1) 템플릿 치환
         filled = b.fill_template(query)
         print("[1] fill_template()")
-        print(f"  입력 query : {query[:100]!r}")
-        print(f"  치환 결과  : {filled[:300]!r}")
+        print(f"  입력 query : {query[:]!r}")
+        print(f"  치환 결과  : {filled[:]!r}")
         if b.user_template is not None:
             assert query in filled, "⚠️ query가 템플릿에 안 들어감!"
             assert "{user_text}" not in filled, "⚠️ 치환 안 된 자리표시자 남음!"
